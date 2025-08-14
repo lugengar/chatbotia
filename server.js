@@ -7,7 +7,9 @@ const qrcode = require('qrcode');
 const fs = require('fs');
 const { Client, LocalAuth } = require('whatsapp-web.js'); // Importar LocalAuth
 const app = express();
-const port = process.env.SERV_PORT || 3000;
+// Render utiliza la variable de entorno 'PORT'. Si no está definida, usa 'SERV_PORT' o 3000.
+const port = process.env.PORT || process.env.SERV_PORT || 3000;
+// Usamos 'SERV_HOST' del archivo .env o '0.0.0.0' para escuchar en todas las interfaces de red, lo cual es necesario en Render
 const host = process.env.SERV_HOST || '0.0.0.0';
 
 // Configurar Express para servir archivos estáticos y procesar JSON
@@ -28,24 +30,50 @@ try {
 const estados = {};
 
 /**
- * Función para llamar a la API de Gemini y generar una respuesta de IA.
+ * Función para llamar a la API de Gemini y generar una respuesta de IA,
+ * incluyendo la capacidad de hacer web scraping si se proporciona una URL.
  * @param {string} mensaje El mensaje del usuario en WhatsApp.
- * @param {string} contexto El contexto del negocio para la IA.
+ * @param {string} contexto El contexto del negocio para la IA, que puede incluir una URL.
  * @returns {Promise<string>} La respuesta generada por la IA o un mensaje de error.
  */
 async function generarRespuestaIA(mensaje, contexto) {
     const url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent";
-    
-    // Este es el formato correcto para el body de la API de Gemini
+    let contenidoWeb = '';
+
+    // Expresión regular para encontrar una URL en el contexto
+    const urlMatch = contexto.match(/(https?:\/\/[^\s]+)/);
+
+    // Si se encuentra una URL, intenta obtener el contenido de la página
+    if (urlMatch) {
+        const paginaUrl = urlMatch[0];
+        try {
+            console.log(`Web scraping: obteniendo contenido de ${paginaUrl}`);
+            const response = await fetch(paginaUrl);
+            if (response.ok) {
+                // Leer el contenido de la página como texto
+                const html = await response.text();
+                // Aquí podrías usar una librería como 'cheerio' o 'jsdom' para
+                // parsear el HTML, pero para este ejemplo simple, solo usaremos
+                // una parte del texto para evitar que el prompt sea demasiado largo.
+                const textoPlano = html.replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim().substring(0, 1500);
+                contenidoWeb = `\n\nContenido de la web de la tienda (${paginaUrl}):\n${textoPlano}\n\n`;
+            } else {
+                console.error(`Error al hacer fetch de la URL: ${response.status}`);
+            }
+        } catch (err) {
+            console.error("Error al obtener la página web:", err);
+            // Si el web scraping falla, simplemente se ignora y se continúa con el contexto original
+        }
+    }
+
+    const promptCompleto = `Contexto: ${contexto}${contenidoWeb}\nMensaje: ${mensaje}`;
+
     const body = {
         contents: [
             {
                 parts: [
                     {
-                        text: `Contexto: ${contexto}` // El contexto como un objeto separado
-                    },
-                    {
-                        text: `Mensaje: ${mensaje}` // El mensaje como un objeto separado
+                        text: promptCompleto
                     }
                 ]
             }
@@ -63,11 +91,7 @@ async function generarRespuestaIA(mensaje, contexto) {
         });
 
         const data = await response.json();
-
-        // La respuesta del texto generado se encuentra en data.candidates[0].content.parts[0].text
         const textoGenerado = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-        
-        // Retornar el texto generado o un mensaje de error si no se encuentra
         return textoGenerado || "No pude generar una respuesta. Por favor, inténtalo de nuevo.";
     } catch (err) {
         console.error("Error llamando a la API de Gemini:", err);
@@ -121,7 +145,7 @@ function crearCliente(usuario) {
         estados[usuario].conectado = false;
         // Se podría agregar lógica para intentar reconectar aquí
     });
-    
+
     // Evento que se dispara cuando se recibe un mensaje
     client.on('message', async message => {
         console.log(`Mensaje recibido de ${message.from}: ${message.body}`);
@@ -158,7 +182,7 @@ app.get('/generate-qr', (req, res) => {
     if (estado.qrCodeData) {
         return res.send(estado.qrCodeData);
     }
-    
+
     // Si aún no se genera el QR, indicarlo
     return res.status(503).send('QR aún no disponible, espere...');
 });
@@ -174,9 +198,7 @@ app.post('/crear-usuario', (req, res) => {
     if (usuarios.find(u => u.usuario === usuario)) {
         return res.status(400).json({ error: 'Usuario ya existe' });
     }
-    
-    // NOTA IMPORTANTE: Se ha eliminado la restricción de un solo bot
-    
+
     const nuevoUsuario = { usuario, contraseña, contexto: contexto || '' };
     usuarios.push(nuevoUsuario);
     fs.writeFileSync('usuarios.json', JSON.stringify(usuarios, null, 2));
