@@ -5,6 +5,7 @@ const contadorElemento = document.getElementById('contador');
 let solicitudEnCurso = false;
 let contadorIntervalo = null;
 let pollInterval = null;
+let contadorIniciado = false; // Nueva variable de estado para evitar que el contador se reinicie
 
 qrForm.addEventListener('submit', async (event) => {
     event.preventDefault();
@@ -29,15 +30,19 @@ qrForm.addEventListener('submit', async (event) => {
             if (qrData.startsWith('data:image')) {
                 // Mostrar QR
                 qrCodeDiv.innerHTML = `<div class="p-4 bg-white rounded-lg shadow-md" style="display: flex; justify-content: center; align-items: center;"><img src="${qrData}" alt="QR Code" style="width: 250px; height: 250px;"></div>`;
-                iniciarContador(50);
+                // Iniciar el contador solo si no está ya en marcha
+                if (!contadorIniciado) {
+                    iniciarContador(50);
+                }
             } else if (qrData === 'CONECTADO') {
                 // Cliente conectado
                 qrCodeDiv.innerHTML = '';
                 contadorElemento.textContent = '✅ ¡Ya estás conectado!';
-       
+        
                 clearInterval(pollInterval);
-                if (contadorIntervalo) clearInterval(contadorIntervalo); // Limpiar el contador si está activo
+                if (contadorIntervalo) clearInterval(contadorIntervalo);
                 solicitudEnCurso = false;
+                contadorIniciado = false; // Resetear el estado
             } else {
                 // QR aún no disponible, esperar
                 console.log('QR aún no listo, esperando...');
@@ -49,6 +54,7 @@ qrForm.addEventListener('submit', async (event) => {
         
             clearInterval(pollInterval);
             solicitudEnCurso = false;
+            contadorIniciado = false; // Resetear el estado
         }
     }
 
@@ -61,8 +67,8 @@ function iniciarContador(segundos) {
     let tiempoRestante = segundos;
     contadorElemento.textContent = `Código QR válido por ${tiempoRestante} segundos`;
 
-
     if (contadorIntervalo) clearInterval(contadorIntervalo);
+    contadorIniciado = true; // Establecer el estado a true
 
     contadorIntervalo = setInterval(() => {
         tiempoRestante--;
@@ -74,6 +80,7 @@ function iniciarContador(segundos) {
             contadorElemento.textContent = '';
             solicitudEnCurso = false;
             if (pollInterval) clearInterval(pollInterval);
+            contadorIniciado = false; // Resetear el estado a false cuando el tiempo se agota
         }
     }, 1000);
 }

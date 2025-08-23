@@ -2,3 +2,7 @@ node_modules
 .wwebjs_cache
 .wwebjs_auth
 .env
+baileys-auth-info
+server2.js
+nsta.js
+cookies.json
