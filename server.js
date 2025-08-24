@@ -1,90 +1,94 @@
 // Cargar variables de entorno
 require('dotenv').config();
 
-// Importar librerías
+// Importar librerías de Node.js
 const express = require('express');
 const qrcode = require('qrcode');
-const fs = require('fs').promises; // Usar la versión de promesas de fs para operaciones asíncronas
-const { Client, LocalAuth } = require('whatsapp-web.js');
+const fs = require('fs').promises;
+const path = require('path');
+const cors = require('cors');
+
+// Importar Baileys y sus dependencias
+const {
+    default: makeWASocket,
+    DisconnectReason,
+    fetchLatestBaileysVersion
+} = require('@whiskeysockets/baileys');
+
+const P = require('pino'); // Usamos Pino para un logging más limpio
+const { Boom } = require('@hapi/boom');
+
 const app = express();
-// Render utiliza la variable de entorno 'PORT'. Si no está definida, usa 'SERV_PORT' o 3000.
+
+// Usar las variables de entorno de Render para el puerto y el host
 const port = process.env.PORT || process.env.SERV_PORT || 3000;
-// Usamos 'SERV_HOST' del archivo .env o '0.0.0.0' para escuchar en todas las interfaces de red, lo cual es necesario en Render
 const host = process.env.SERV_HOST || '0.0.0.0';
 
-// Configurar Express para servir archivos estáticos y procesar JSON
+// --- CORS CONFIG ---
+app.use(cors({
+    origin: 'https://barbiniwebdesign.com.ar', // 🔑 tu dominio autorizado
+    methods: ['GET', 'POST'],
+    allowedHeaders: ['Content-Type', 'Authorization']
+}));
+
+// Configurar Express
 app.use(express.static('public'));
 app.use(express.json());
 
-// Cargar usuarios desde un archivo JSON de forma asíncrona
+// --- MÓDULOS DE DATOS Y ESTADO ---
 let usuarios = [];
-fs.readFile('usuarios.json', 'utf8')
-    .then(data => {
-        usuarios = JSON.parse(data);
-        console.log('Usuarios cargados:', usuarios.map(u => u.usuario));
-    })
-    .catch(() => {
-        console.log('usuarios.json no existe o está vacío. Se creará al añadir usuarios.');
-    });
-
-// Objeto para almacenar los estados de los clientes (QR, conexión) y el cache de web scraping
-// Las claves son los nombres de usuario
-const estados = {};
-
-// Cache en memoria para el contenido web
+const RUTA_USUARIOS = 'usuarios.json';
+const CACHE_DURATION_MS = 3600000; // 1 hora
+const estadosClientes = {};
 const webContentCache = {};
-const CACHE_DURATION_MS = 3600000; // 1 hora en milisegundos
 
-/**
- * Función para llamar a la API de Gemini y generar una respuesta de IA,
- * incluyendo la capacidad de hacer web scraping si se proporciona una URL.
- * Se ha mejorado con un cache para evitar peticiones repetidas.
- * @param {string} mensaje El mensaje del usuario en WhatsApp.
- * @param {string} contexto El contexto del negocio para la IA, que puede incluir una URL.
- * @returns {Promise<string>} La respuesta generada por la IA o un mensaje de error.
- */
+// --- Cargar usuarios al iniciar ---
+async function cargarUsuarios() {
+    try {
+        const data = await fs.readFile(RUTA_USUARIOS, 'utf8');
+        usuarios = JSON.parse(data);
+        console.log(`✅ Usuarios cargados: ${usuarios.length} en total.`);
+    } catch (err) {
+        console.log(`⚠️ Archivo ${RUTA_USUARIOS} no encontrado o vacío. Se creará al añadir usuarios.`);
+        usuarios = [];
+    }
+}
+cargarUsuarios();
+
+// --- IA Gemini ---
 async function generarRespuestaIA(mensaje, contexto) {
     const url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent";
     let contenidoWeb = '';
 
-    // Expresión regular para encontrar una URL en el contexto
     const urlMatch = contexto.match(/(https?:\/\/[^\s]+)/);
-
     if (urlMatch) {
         const paginaUrl = urlMatch[0];
         const cacheEntry = webContentCache[paginaUrl];
         const now = Date.now();
 
-        // Verificar si el contenido está en el cache y no ha expirado
         if (cacheEntry && (now - cacheEntry.timestamp < CACHE_DURATION_MS)) {
-            console.log(`Web scraping: usando contenido en cache para ${paginaUrl}`);
+            console.log(`Web scraping: usando caché para ${paginaUrl}`);
             contenidoWeb = cacheEntry.content;
         } else {
-            // Si no hay cache o ha expirado, hacer web scraping
             try {
                 console.log(`Web scraping: obteniendo contenido de ${paginaUrl}`);
                 const response = await fetch(paginaUrl);
                 if (response.ok) {
                     const html = await response.text();
-                    // Limitar el contenido para evitar prompts muy largos
                     const textoPlano = html.replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim().substring(0, 1500);
                     contenidoWeb = `\n\nContenido de la web de la tienda (${paginaUrl}):\n${textoPlano}\n\n`;
-                    // Guardar en el cache
-                    webContentCache[paginaUrl] = {
-                        content: contenidoWeb,
-                        timestamp: now
-                    };
+                    webContentCache[paginaUrl] = { content: contenidoWeb, timestamp: now };
                 } else {
-                    console.error(`Error al hacer fetch de la URL: ${response.status}`);
+                    console.error(`❌ Error al hacer fetch de la URL: ${response.status}`);
                 }
             } catch (err) {
-                console.error("Error al obtener la página web:", err);
+                console.error("❌ Error al obtener la página web:", err);
             }
         }
     }
 
     const promptCompleto = `Contexto: ${contexto}${contenidoWeb}\nMensaje: ${mensaje}`;
-    const body = {
+    const payload = {
         contents: [{ parts: [{ text: promptCompleto }] }]
     };
 
@@ -93,88 +97,107 @@ async function generarRespuestaIA(mensaje, contexto) {
             method: "POST",
             headers: {
                 "Content-Type": "application/json",
-                "X-goog-api-key": process.env.GEMINI_API_KEY
+                "x-goog-api-key": process.env.GEMINI_API_KEY
             },
-            body: JSON.stringify(body)
+            body: JSON.stringify(payload)
         });
 
         const data = await response.json();
         const textoGenerado = data?.candidates?.[0]?.content?.parts?.[0]?.text;
         return textoGenerado || "No pude generar una respuesta. Por favor, inténtalo de nuevo.";
     } catch (err) {
-        console.error("Error llamando a la API de Gemini:", err);
+        console.error("❌ Error llamando a la API de Gemini:", err);
         return "Hubo un error al procesar el mensaje. Por favor, inténtalo de nuevo más tarde.";
     }
 }
 
-/**
- * Crea o inicializa un cliente de WhatsApp para un usuario específico.
- * @param {string} usuario El nombre de usuario.
- * @returns {Client} El cliente de WhatsApp.
- */
-function crearCliente(usuario) {
-    if (estados[usuario]?.cliente) {
-        console.log(`Cliente para ${usuario} ya existe.`);
-        return estados[usuario].cliente;
+// --- Crear cliente WhatsApp sin guardar sesión ---
+async function crearCliente(usuario) {
+    if (estadosClientes[usuario]?.conectado) {
+        console.log(`Cliente para ${usuario} ya está conectado.`);
+        return;
     }
 
-    console.log(`Creando cliente para ${usuario}...`);
+    const { version } = await fetchLatestBaileysVersion();
+    console.log(`Usando la versión de Baileys: ${version}`);
 
-    const client = new Client({
-        authStrategy: new LocalAuth({
-            clientId: `client-${usuario}`
-        }),
-        puppeteer: {
-            headless: true,
-            args: ['--no-sandbox', '--disable-setuid-sandbox']
+    // ⚠️ Sesión sin persistencia → siempre pedirá QR al reiniciar
+    const socket = makeWASocket({
+        version,
+        logger: P({ level: 'silent' }),
+        printQRInTerminal: false,
+        auth: undefined,
+        browser: ['Bot de WhatsApp', 'Chrome', '1.0']
+    });
+
+    estadosClientes[usuario] = {
+        socket: socket,
+        qrCodeData: null,
+        conectado: false,
+        lastAttempt: 0
+    };
+
+    // --- Eventos de conexión ---
+    socket.ev.on('connection.update', (update) => {
+        const { connection, lastDisconnect, qr } = update;
+
+        if (qr) {
+            console.log(`QR generado para ${usuario}`);
+            qrcode.toDataURL(qr, (err, url) => {
+                if (!err) estadosClientes[usuario].qrCodeData = url;
+            });
+        }
+
+        if (connection === 'close') {
+            console.log(`❌ Conexión cerrada para ${usuario}.`);
+            estadosClientes[usuario].conectado = false;
+            delete estadosClientes[usuario];
+        } else if (connection === 'open') {
+            console.log(`✅ Cliente ${usuario} conectado.`);
+            estadosClientes[usuario].qrCodeData = null;
+            estadosClientes[usuario].conectado = true;
         }
     });
 
-    estados[usuario] = { cliente: client, qrCodeData: null, conectado: false };
+    // --- Eventos de mensajes ---
+    socket.ev.on('messages.upsert', async ({ messages }) => {
+        for (const message of messages) {
+            if (message.key.fromMe) continue;
 
-    client.on('qr', qr => {
-        console.log(`QR generado para ${usuario}`);
-        qrcode.toDataURL(qr, (err, url) => {
-            if (!err) estados[usuario].qrCodeData = url;
-        });
+            const sender = message.key.remoteJid;
+            const messageText = message.message?.conversation || message.message?.extendedTextMessage?.text;
+
+            if (messageText) {
+                console.log(`Mensaje recibido de ${sender}: ${messageText}`);
+                const contexto = usuarios.find(u => u.usuario === usuario)?.contexto || '';
+                try {
+                    const respuesta = await generarRespuestaIA(messageText, contexto);
+                    await socket.sendMessage(sender, { text: respuesta });
+                } catch (err) {
+                    console.error(`❌ Error al procesar el mensaje de ${sender}:`, err);
+                    await socket.sendMessage(sender, { text: 'Hubo un error al procesar tu mensaje.' });
+                }
+            }
+        }
     });
-
-    client.on('ready', () => {
-        console.log(`✅ Cliente ${usuario} conectado`);
-        estados[usuario].qrCodeData = null;
-        estados[usuario].conectado = true;
-    });
-
-    client.on('disconnected', (reason) => {
-        console.log(`❌ Cliente ${usuario} desconectado. Motivo: ${reason}`);
-        estados[usuario].conectado = false;
-    });
-
-    client.on('message', async message => {
-        console.log(`Mensaje recibido de ${message.from}: ${message.body}`);
-        const contexto = usuarios.find(u => u.usuario === usuario)?.contexto || '';
-        const respuesta = await generarRespuestaIA(message.body, contexto);
-        message.reply(respuesta);
-    });
-
-    client.initialize();
-    return client;
 }
 
-// --- Rutas de la API Express ---
-
+// --- Rutas API ---
 app.get('/generate-qr', (req, res) => {
-    const { text1, text2 } = req.query;
-    console.log(`Solicitud de QR: usuario=${text1}`);
+    const { text1: usuario, text2: contraseña } = req.query;
+    const usuarioObj = usuarios.find(u => u.usuario === usuario && u.contraseña === contraseña);
 
-    const usuarioObj = usuarios.find(u => u.usuario === text1 && u.contraseña === text2);
     if (!usuarioObj) {
-        return res.status(403).send('Usuario o contraseña incorrectos');
+        return res.status(403).send('Usuario o contraseña incorrectos.');
     }
 
-    crearCliente(usuarioObj.usuario);
+    const estado = estadosClientes[usuario] || {};
 
-    const estado = estados[usuarioObj.usuario];
+    if (!estado.socket) {
+        crearCliente(usuario);
+        return res.status(503).send('Iniciando conexión, espere...');
+    }
+
     if (estado.conectado) {
         return res.send('CONECTADO');
     }
@@ -182,7 +205,7 @@ app.get('/generate-qr', (req, res) => {
         return res.send(estado.qrCodeData);
     }
 
-    return res.status(503).send('QR aún no disponible, espere...');
+    res.status(503).send('QR aún no disponible. Por favor, espere...');
 });
 
 app.post('/crear-usuario', async (req, res) => {
@@ -190,39 +213,88 @@ app.post('/crear-usuario', async (req, res) => {
     console.log(`Intento de crear usuario: ${usuario}`);
 
     if (!usuario || !contraseña) {
-        return res.status(400).json({ error: 'Faltan campos' });
+        return res.status(400).json({ error: 'Faltan campos (usuario y contraseña).' });
     }
     if (usuarios.find(u => u.usuario === usuario)) {
-        return res.status(400).json({ error: 'Usuario ya existe' });
+        return res.status(400).json({ error: 'El usuario ya existe.' });
     }
 
     const nuevoUsuario = { usuario, contraseña, contexto: contexto || '' };
     usuarios.push(nuevoUsuario);
 
-    // Escribir el archivo de forma asíncrona
     try {
-        await fs.writeFile('usuarios.json', JSON.stringify(usuarios, null, 2));
-        console.log(`Usuario creado: ${usuario}`);
-        res.json({ success: true, message: 'Usuario creado correctamente' });
+        await fs.writeFile(RUTA_USUARIOS, JSON.stringify(usuarios, null, 2));
+        console.log(`✅ Usuario creado: ${usuario}`);
+        res.json({ success: true, message: 'Usuario creado correctamente.' });
     } catch (err) {
-        console.error('Error al escribir el archivo de usuarios:', err);
-        res.status(500).json({ error: 'Error interno al guardar el usuario' });
+        console.error('❌ Error al escribir el archivo de usuarios:', err);
+        res.status(500).json({ error: 'Error interno al guardar el usuario.' });
     }
 });
 
 app.get('/status', (req, res) => {
-    const { text1, text2 } = req.query;
-    const usuarioObj = usuarios.find(u => u.usuario === text1 && u.contraseña === text2);
+    const { text1: usuario, text2: contraseña } = req.query;
+    const usuarioObj = usuarios.find(u => u.usuario === usuario && u.contraseña === contraseña);
+
     if (!usuarioObj) {
-        return res.status(403).json({ error: 'Credenciales incorrectas' });
+        return res.status(403).json({ error: 'Credenciales incorrectas.' });
     }
 
-    const estado = estados[usuarioObj.usuario] || {};
-    console.log(`Estado de ${usuarioObj.usuario}: conectado=${estado.conectado || false}`);
+    const estado = estadosClientes[usuario] || {};
     res.json({ conectado: estado.conectado || false });
 });
 
-// Iniciar el servidor
+// --- Iniciar servidor ---
 app.listen(port, host, () => {
     console.log(`Servidor escuchando en http://${host}:${port}`);
+});
+
+
+// --- FUNCION INDEPENDIENTE IA ---
+async function responderIA(texto, contexto = "") {
+    const url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent";
+
+    // El contexto se concatena con la pregunta
+    const prompt = contexto 
+        ? `Contexto: ${contexto}\n\nPregunta: ${texto}` 
+        : texto;
+
+    const payload = {
+        contents: [{ parts: [{ text: prompt }] }]
+    };
+
+    try {
+        const response = await fetch(url, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                "x-goog-api-key": process.env.GEMINI_API_KEY
+            },
+            body: JSON.stringify(payload)
+        });
+
+        const data = await response.json();
+        const textoGenerado = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+
+        return textoGenerado || "La IA no pudo generar una respuesta.";
+    } catch (err) {
+        console.error("❌ Error llamando a la API de Gemini:", err);
+        return "Error procesando la consulta.";
+    }
+}
+
+app.post('/preguntar-ia', async (req, res) => {
+    const { pregunta, contexto } = req.body;
+
+    if (!pregunta) {
+        return res.status(400).json({ error: 'Falta el campo "pregunta".' });
+    }
+
+    try {
+        const respuesta = await responderIA(pregunta, contexto);
+        res.json({ respuesta });
+    } catch (err) {
+        console.error("❌ Error en /preguntar-ia:", err);
+        res.status(500).json({ error: 'Error interno al procesar la pregunta.' });
+    }
 });
