@@ -21,18 +21,12 @@ const { Boom } = require('@hapi/boom');
 const app = express();
 
 // --- CORS CONFIG ---
-const allowedOrigins = ["https://barbiniwebdesign.com.ar", "http://localhost:3000","http://127.0.0.1:5500"];
 app.use(cors({
-    origin: function (origin, callback) {
-        if (!origin || allowedOrigins.includes(origin)) {
-            callback(null, true);
-        } else {
-            callback(new Error("No permitido por CORS"));
-        }
-    },
-    methods: ['GET','POST'],
-    allowedHeaders: ['Content-Type','Authorization']
-}));
+    origin: "*",
+    methods: ["GET","POST"],
+    allowedHeaders: ["Content-Type","Authorization"]
+  }));
+  
 
 // Express
 app.use(express.static('public'));
